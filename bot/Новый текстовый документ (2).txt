@@ -1,0 +1,185 @@
+import asyncio
+import logging
+import os
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart, Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    Message,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ContentType,
+)
+from dotenv import load_dotenv
+
+# ---------- Конфиг ----------
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
+if not BOT_TOKEN or not ADMIN_ID:
+    raise SystemExit("❌ Укажи BOT_TOKEN и ADMIN_ID в файле .env")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("feedback-bot")
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+
+# message_id сообщения админу -> user_id пользователя
+# (чтобы понимать, кому отвечать при Reply)
+pending_replies: dict[int, int] = {}
+
+
+# ---------- Состояния ----------
+class FeedbackState(StatesGroup):
+    waiting_for_question = State()   # «Задать вопрос» / /creative
+    waiting_for_error = State()      # «Сообщить об ошибке» / /error
+
+
+# ---------- Клавиатура ----------
+main_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Дать идею")],
+        [KeyboardButton(text="Задать вопрос")],
+        [KeyboardButton(text="Сообщить об ошибке")],
+    ],
+    resize_keyboard=True,
+)
+
+
+# ---------- Старт ----------
+@dp.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "Привет! Я бот обратной связи.\n\n"
+        "Выбери действие на клавиатуре или используй команды:\n"
+        "/creative — предложить идею\n"
+        "/error — сообщить об ошибке",
+        reply_markup=main_keyboard,
+    )
+    await notify_admin(
+        f"👤 {message.from_user.full_name} "
+        f"({user_tag(message.from_user)}) запустил бота."
+    )
+
+
+# ---------- «Дать идею» / /creative ----------
+@dp.message(F.text == "Дать идею")
+@dp.message(Command("creative"))
+async def ask_idea(message: Message, state: FSMContext):
+    await state.set_state(FeedbackState.waiting_for_question)
+    await message.answer("✍️ Напиши свою идею — я передам её автору.")
+
+
+# ---------- «Задать вопрос» / /error ----------
+@dp.message(F.text == "Задать вопрос")
+@dp.message(F.text == "Сообщить об ошибке")
+@dp.message(Command("error"))
+async def ask_error(message: Message, state: FSMContext):
+    await state.set_state(FeedbackState.waiting_for_error)
+    await message.answer("⚠️ Опиши проблему — я передам её администратору.")
+
+
+# ---------- Приём сообщений от пользователя ----------
+@dp.message(FeedbackState.waiting_for_question)
+@dp.message(FeedbackState.waiting_for_error)
+async def forward_to_admin(message: Message, state: FSMContext):
+    current = await state.get_state()
+
+    if current == FeedbackState.waiting_for_question.state:
+        title = "💡 <b>Новая идея</b>"
+        success = "✅ Идея отправлена! Ожидай ответа."
+    else:
+        title = "⚠️ <b>Сообщение об ошибке</b>"
+        success = "✅ Ошибка передана. Спасибо!"
+
+    header = (
+        f"{title}\n"
+        f"От: {message.from_user.full_name} "
+        f"({user_tag(message.from_user)})\n"
+        f"ID: <code>{message.from_user.id}</code>"
+    )
+
+    # Копируем ЛЮБОЙ тип контента (текст, фото, видео, документ, стикер и т.д.)
+    sent = await message.copy_to(chat_id=ADMIN_ID)
+
+    # Подпись/пояснение отдельным сообщением, чтобы Reply точно работал
+    note = await bot.send_message(
+        ADMIN_ID,
+        f"{header}\n\n"
+        f"<i>Ответь Reply на это сообщение — ответ уйдёт пользователю.</i>",
+        parse_mode="HTML",
+    )
+
+    pending_replies[note.message_id] = message.from_user.id
+    pending_replies[sent.message_id] = message.from_user.id
+
+    await message.answer(success, reply_markup=main_keyboard)
+    await state.clear()
+
+
+# ---------- Ответ админа пользователю ----------
+@dp.message(F.chat.id == ADMIN_ID, F.reply_to_message)
+async def admin_reply(message: Message):
+    target_id = pending_replies.get(message.reply_to_message.message_id)
+    if not target_id:
+        await message.answer(
+            "⚠️ Не понял, кому отвечать. Отвечай Reply на сообщение-уведомление бота."
+        )
+        return
+
+    try:
+        # Копируем ответ как есть — с фото, текстом и т.д.
+        await message.copy_to(chat_id=target_id)
+        await message.answer("✅ Ответ отправлен пользователю!")
+    except Exception as e:
+        log.exception("Ошибка отправки ответа")
+        await message.answer(f"❌ Не удалось отправить: {e}")
+
+
+# ---------- Всё прочее ----------
+@dp.message(F.chat.id != ADMIN_ID)
+async def fallback(message: Message):
+    await message.answer(
+        "Не понял 🤔 Используй кнопки ниже или команды /creative, /error.",
+        reply_markup=main_keyboard,
+    )
+
+
+# ---------- Утилиты ----------
+def user_tag(user) -> str:
+    return f"@{user.username}" if user.username else f"ID {user.id}"
+
+
+async def notify_admin(text: str):
+    try:
+        await bot.send_message(ADMIN_ID, text)
+    except Exception as e:
+        log.warning("Не смог отправить сообщение админу: %s", e)
+
+
+# ---------- Startup ----------
+async def on_startup(dispatcher: Dispatcher):
+    bot_info = await dispatcher.bot.get_me()
+    print("\n" + "=" * 50)
+    print(f"✅ Бот @{bot_info.username} запущен!")
+    print("=" * 50 + "\n")
+    await notify_admin(f"🚀 Бот @{bot_info.username} запущен и готов к работе.")
+
+
+# ---------- Запуск ----------
+async def main():
+    dp.startup.register(on_startup)
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
